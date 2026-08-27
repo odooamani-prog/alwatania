@@ -107,7 +107,27 @@ def renumber(items):
         item["id"] = str(idx)
     return items
 
-# ─── دالة إرسال التليجرام الموحدة ─────────────────────────────────────
+def clean_acc(s):
+    return str(s or "").replace(" ", "").strip()
+
+def parse_amount(s):
+    cleaned = str(s or "").replace(",", "").strip()
+    try:
+        return float(cleaned)
+    except ValueError:
+        match = re.search(r'[\d.]+', cleaned)
+        return float(match.group()) if match else 0.0
+
+def get_direction(result, my_account):
+    if not my_account:
+        return "in"
+    my = clean_acc(my_account)
+    from_acc = clean_acc(result.get("من_حساب", ""))
+    if from_acc == my:
+        return "out"
+    return "in"
+
+# ─── دالة إرسال التليجرام ──────────────────────────────────────────────
 def send_telegram_message(text):
     try:
         data = load_data()
@@ -146,7 +166,6 @@ def telegram_webhook():
                     data["telegram"] = tg
                     save_data(data)
                     
-                    # إرسال رسالة الترحيب والاشتراك
                     requests.post(
                         f"{TELEGRAM_API_BASE}/sendMessage",
                         json={
@@ -202,36 +221,35 @@ def ocr_image_groq(image_path):
     clean_text = re.sub(r'```(?:json)?', '', raw_text).strip().strip('`').strip()
     return raw_text, json.loads(clean_text)
 
-# ─── ENDPOINTS ──────────────────────────────────────────────────────
+# ─── ENDPOINTS (تطبيق الجوال + التليجرام) ───────────────────────────────
 
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({"status": "running", "service": "Alwatania Unified Backend"})
 
-# 1. تحليل الإيصالات بالذكاء الاصطناعي
-@app.route('/dashboard/api/ocr/upload', methods=['POST'])
-def upload_and_ocr():
-    try:
-        if 'image' not in request.files:
-            return jsonify({"success": False, "error": "لم يتم إرسال صورة"}), 400
-        file = request.files['image']
-        filename = secure_filename(f"{uuid.uuid4()}_{file.filename}")
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
+# 1. جلب المعاملات لتطبيق الجوال (تم إصلاح الخطأ 404 هنا)
+@app.route('/dashboard/api/transactions', methods=['GET'])
+def get_transactions_for_mobile():
+    account = request.args.get('account', '').strip()
+    data = load_data()
+    records = data.get("transactions", [])
 
-        raw_text, parsed = ocr_image_groq(filepath)
+    formatted_transactions = []
+    for r in records:
+        if "error" in r or not r.get("المبلغ"):
+            continue
 
-        # إرسال إشعار بالتستخرج
-        send_telegram_message(
-            "📷 <b>تم فحص إيصال بنكي جديد (OCR)</b>\n"
-            f"👤 المرسل إليه: {parsed.get('اسم_المرسل_إليه', '-')}\n"
-            f"💰 المبلغ: {parsed.get('المبلغ', '-')}\n"
-            f"🆔 رقم العملية: {parsed.get('رقم_العملية', '-')}"
-        )
+        direction = get_direction(r, account)
+        tx = {
+            "id": r.get("id"),
+            "direction": direction,
+            "amount": parse_amount(r.get("المبلغ")),
+            "savedAt": r.get("وقت_الحفظ", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+            "result": r
+        }
+        formatted_transactions.append(tx)
 
-        return jsonify({"success": True, "data": parsed}), 200
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({"success": True, "transactions": formatted_transactions}), 200
 
 # 2. حفظ معاملة بنكية
 @app.route('/dashboard/api/transactions/save', methods=['POST'])
@@ -255,7 +273,31 @@ def save_transaction():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-# 3. جهات الاتصال
+# 3. OCR فحص صورة
+@app.route('/dashboard/api/ocr/upload', methods=['POST'])
+def upload_and_ocr():
+    try:
+        if 'image' not in request.files:
+            return jsonify({"success": False, "error": "لم يتم إرسال صورة"}), 400
+        file = request.files['image']
+        filename = secure_filename(f"{uuid.uuid4()}_{file.filename}")
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(filepath)
+
+        raw_text, parsed = ocr_image_groq(filepath)
+
+        send_telegram_message(
+            "📷 <b>تم فحص إيصال بنكي جديد (OCR)</b>\n"
+            f"👤 المرسل إليه: {parsed.get('اسم_المرسل_إليه', '-')}\n"
+            f"💰 المبلغ: {parsed.get('المبلغ', '-')}\n"
+            f"🆔 رقم العملية: {parsed.get('رقم_العملية', '-')}"
+        )
+
+        return jsonify({"success": True, "data": parsed}), 200
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+# 4. جهات الاتصال
 @app.route('/dashboard/api/contacts', methods=['GET', 'POST'])
 def handle_contacts():
     data = load_data()
@@ -283,7 +325,7 @@ def delete_contact(cid):
         return jsonify({"success": True}), 200
     return jsonify({"success": False, "error": "غير موجود"}), 404
 
-# 4. إدارة العمال
+# 5. إدارة العمال
 @app.route('/dashboard/api/workers', methods=['GET', 'POST'])
 def handle_workers():
     data = load_data()
@@ -304,7 +346,7 @@ def handle_workers():
 
     return jsonify({"success": True, "workers": data["workers"]})
 
-# 5. تسجيل حركة ديون
+# 6. تسجيل حركة ديون
 @app.route('/transactions', methods=['POST'])
 def add_debt_transaction():
     try:
@@ -324,14 +366,14 @@ def add_debt_transaction():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-# 6. تحديثات مصنع العلف
+# 7. تحديثات مصنع العلف
 @app.route('/api/transaction', methods=['POST'])
 def feed_factory_transaction():
     try:
         req = request.get_json(force=True, silent=True) or {}
         ing_key = req.get("ingredient")
         qty = req.get("quantity")
-        action = req.get("action")  # add / subtract
+        action = req.get("action")
 
         data = load_data()
         ff = data.get("feed_factory", default_feed_factory())
