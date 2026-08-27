@@ -34,6 +34,9 @@ TELEGRAM_BOT_TOKEN = config.get("TELEGRAM_BOT_TOKEN") or "8934774619:AAEELQfe6o5
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 # ─── ملف بيانات واحد موحّد لكل شيء ──────────────────────────────────
+# (جهات الاتصال + العمال + المعاملات البنكية + بيانات مزرعة الدواجن)
+# مسار مطلق بناءً على مكان هذا الملف نفسه - يضمن إنه دائمًا نفس الملف
+# بغض النظر عن المجلد اللي تشغّل منه "python merged_app.py"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "data.json")
 
@@ -124,6 +127,11 @@ def default_data():
     }
 
 def load_data():
+    """تحميل ملف البيانات الموحّد. ينشئه بالقيم الافتراضية فقط إذا لم يكن
+    موجودًا إطلاقًا. لو الملف موجود لكن تالف/فيه خطأ قراءة، لا يتم أبدًا
+    استبدال بياناتك الحقيقية بالبيانات الافتراضية بصمت - بدلاً من ذلك يتم
+    أخذ نسخة احتياطية من الملف التالف وإرجاع بيانات فارغة مع رسالة واضحة
+    في الطرفية عشان تلاحظ المشكلة فورًا."""
     if not os.path.exists(DATA_FILE):
         data = default_data()
         save_data(data)
@@ -146,6 +154,7 @@ def load_data():
         save_data(data)
         return data
 
+    # التأكد من وجود كل الأقسام حتى لو الملف قديم/ناقص (بدون مسح أي قسم موجود)
     changed = False
     if "contacts" not in data:
         data["contacts"] = []
@@ -192,15 +201,20 @@ def load_data():
     return data
 
 def save_data(data):
+    """كتابة ذرية (atomic write): يكتب لملف مؤقت ثم يستبدل الملف الأصلي
+    دفعة واحدة، عشان أي انقطاع أثناء الكتابة (تصادم طلبات متزامنة) ما
+    يخرّب الملف ويخلي القراءة القادمة تفشل."""
     tmp_path = DATA_FILE + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
     os.replace(tmp_path, DATA_FILE)
 
 def renumber(items):
+    """إعادة ترقيم العناصر بأرقام بسيطة متسلسلة 1، 2، 3 ..."""
     for idx, item in enumerate(items, start=1):
         item["id"] = str(idx)
     return items
+
 
 # ══════════════════════════════════════════════════════════════════
 # القسم الأول: جهات الاتصال + العمال + إيصالات بنك الخرطوم (OCR)
@@ -397,6 +411,7 @@ def save_transaction_record(new_data):
 
     return len(transactions), transactions[-1]["id"]
 
+
 # ─── دوال بوت تيليجرام (@Alwatania_Reports_bot) ────────────────────
 
 def send_telegram_message(text):
@@ -411,15 +426,11 @@ def send_telegram_message(text):
         print("⚠️ لم يتم إرسال رسالة تيليجرام: لا توجد أي محادثة مسجّلة بعد "
               "(لازم ترسل /start للبوت @Alwatania_Reports_bot أولاً).")
         return
-    
-    # تنسيق النص بشكل صحيح لـ HTML
-    formatted_text = text.replace("<", "&lt;").replace(">", "&gt;")
-    
     for chat_id in chat_ids:
         try:
             resp = requests.post(
                 f"{TELEGRAM_API_BASE}/sendMessage",
-                json={"chat_id": chat_id, "text": formatted_text, "parse_mode": "HTML"},
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
                 timeout=10
             )
             if resp.status_code != 200:
@@ -429,6 +440,9 @@ def send_telegram_message(text):
             print(f"❌ استثناء أثناء إرسال رسالة تيليجرام للمحادثة {chat_id}:", e)
 
 def poll_telegram_updates():
+    """يستطلع تحديثات البوت بشكل دوري لتسجيل أي محادثة جديدة بعتت /start،
+    بدل الحاجة لإدخال chat_id يدويًا. يخزن آخر update_id عشان ما يعالج
+    نفس الرسالة مرتين."""
     try:
         data = load_data()
         tg = data.setdefault("telegram", default_telegram())
@@ -478,6 +492,7 @@ def poll_telegram_updates():
         print("❌ خطأ أثناء استطلاع تحديثات تيليجرام:", e)
 
 def send_daily_telegram_report():
+    """يبني ويرسل تقريرًا يوميًا موجزًا بكل المعاملات (بنكية / ديون / مصنع علف)."""
     try:
         data = load_data()
         today_str = datetime.now().strftime("%Y-%m-%d")
@@ -593,8 +608,7 @@ def add_contact():
         save_data(data)
         send_telegram_message(
             "👤 <b>جهة اتصال جديدة</b>\n"
-            f"الاسم: {new_contact['name']}\n"
-            f"الهاتف: {new_contact['phone']}"
+            f"الاسم: {new_contact['name']}\nالهاتف: {new_contact['phone']}"
         )
         return jsonify({"success": True, "contact": contacts[0]}), 201
     except Exception as e:
@@ -607,11 +621,9 @@ def update_contact(contact_id):
         data = load_data()
         contacts = data["contacts"]
         updated_contact = None
-        old_data = None
 
         for idx, c in enumerate(contacts):
             if str(c.get("id")) == str(contact_id):
-                old_data = c.copy()
                 if "name" in req_data: c["name"] = str(req_data["name"]).strip()
                 if "phone" in req_data: c["phone"] = str(req_data["phone"]).strip()
                 if "avatar" in req_data: c["avatar"] = str(req_data["avatar"]).strip()
@@ -624,17 +636,9 @@ def update_contact(contact_id):
 
         data["contacts"] = contacts
         save_data(data)
-        
-        # رسالة تيليجرام مع التغييرات
-        changes = []
-        if old_data and "name" in req_data and old_data.get("name") != updated_contact.get("name"):
-            changes.append(f"الاسم: {old_data.get('name')} → {updated_contact.get('name')}")
-        if old_data and "phone" in req_data and old_data.get("phone") != updated_contact.get("phone"):
-            changes.append(f"الهاتف: {old_data.get('phone')} → {updated_contact.get('phone')}")
-        
         send_telegram_message(
-            "✏️ <b>تعديل جهة اتصال</b>\n" +
-            ("\n".join(changes) if changes else f"الاسم: {updated_contact.get('name','-')}")
+            "✏️ <b>تعديل جهة اتصال</b>\n"
+            f"الاسم: {updated_contact.get('name','-')}\nالهاتف: {updated_contact.get('phone','-')}"
         )
         return jsonify({"success": True, "contact": updated_contact}), 200
     except Exception as e:
@@ -657,8 +661,7 @@ def delete_contact(contact_id):
         data["contacts"] = new_contacts
         save_data(data)
         send_telegram_message(
-            f"🗑️ <b>حذف جهة اتصال</b>\n"
-            f"الاسم: {deleted_contact.get('name','-') if deleted_contact else '-'}"
+            f"🗑️ <b>حذف جهة اتصال</b>\nالاسم: {deleted_contact.get('name','-') if deleted_contact else '-'}"
         )
         return jsonify({"success": True, "message": "تم الحذف بنجاح"}), 200
     except Exception as e:
@@ -693,9 +696,7 @@ def add_worker():
         save_data(data)
         send_telegram_message(
             "👷 <b>عامل جديد</b>\n"
-            f"الاسم: {new_worker['name']}\n"
-            f"المرتب الشهري: {new_worker['monthlySalary']:,.2f}\n"
-            f"تاريخ البدء: {new_worker['startDate']}"
+            f"الاسم: {new_worker['name']}\nالمرتب الشهري: {new_worker['monthlySalary']:,.2f}"
         )
         return jsonify({"success": True, "worker": workers[-1]}), 201
     except Exception as e:
@@ -709,11 +710,9 @@ def update_worker(worker_id):
         workers = data["workers"]
         updated = False
         updated_worker = None
-        old_data = None
 
         for idx, w in enumerate(workers):
             if str(w.get("id")) == str(worker_id):
-                old_data = w.copy()
                 if "name" in req_data: w["name"] = str(req_data["name"]).strip()
                 if "startDate" in req_data: w["startDate"] = str(req_data["startDate"]).strip()
                 if "monthlySalary" in req_data: w["monthlySalary"] = float(req_data["monthlySalary"])
@@ -728,16 +727,9 @@ def update_worker(worker_id):
 
         data["workers"] = workers
         save_data(data)
-        
-        changes = []
-        if old_data and "name" in req_data and old_data.get("name") != updated_worker.get("name"):
-            changes.append(f"الاسم: {old_data.get('name')} → {updated_worker.get('name')}")
-        if old_data and "monthlySalary" in req_data and old_data.get("monthlySalary") != updated_worker.get("monthlySalary"):
-            changes.append(f"المرتب: {old_data.get('monthlySalary')} → {updated_worker.get('monthlySalary')}")
-        
         send_telegram_message(
-            "✏️ <b>تعديل بيانات عامل</b>\n" +
-            ("\n".join(changes) if changes else f"الاسم: {updated_worker.get('name','-')}")
+            "✏️ <b>تعديل بيانات عامل</b>\n"
+            f"الاسم: {updated_worker.get('name','-')}\nالمرتب: {updated_worker.get('monthlySalary','-')}"
         )
         return jsonify({"success": True, "worker": updated_worker})
     except Exception as e:
@@ -759,8 +751,7 @@ def delete_worker(worker_id):
         data["workers"] = workers
         save_data(data)
         send_telegram_message(
-            f"🗑️ <b>حذف عامل</b>\n"
-            f"الاسم: {deleted_worker.get('name','-') if deleted_worker else '-'}"
+            f"🗑️ <b>حذف عامل</b>\nالاسم: {deleted_worker.get('name','-') if deleted_worker else '-'}"
         )
         return jsonify({"success": True, "message": "تم حذف العامل بنجاح"})
     except Exception as e:
@@ -878,10 +869,8 @@ def update_transaction(transaction_id):
 
     updated = False
     updated_record = None
-    old_record = None
     for i, r in enumerate(records):
         if str(r.get("id")) == str(transaction_id):
-            old_record = r.copy()
             for key, value in req_data.items():
                 r[key] = value
             r["وقت_التعديل"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -895,16 +884,10 @@ def update_transaction(transaction_id):
 
     data["transactions"] = records
     save_data(data)
-    
-    changes = []
-    if old_record:
-        for key in req_data:
-            if key in old_record and old_record.get(key) != req_data.get(key):
-                changes.append(f"{key}: {old_record.get(key)} → {req_data.get(key)}")
-    
     send_telegram_message(
-        "✏️ <b>تعديل معاملة بنكية</b>\n" +
-        ("\n".join(changes) if changes else f"المعاملة رقم {transaction_id}")
+        "✏️ <b>تعديل معاملة بنكية</b>\n"
+        f"المرسل إليه: {updated_record.get('اسم_المرسل_إليه','-')}\n"
+        f"المبلغ: {updated_record.get('المبلغ','-')}"
     )
     return jsonify({"success": True, "message": "تم التعديل بنجاح", "data": updated_record})
 
@@ -982,7 +965,7 @@ def trigger_custom_alert(house_id, target, title):
     poultry = data["poultry"]
     house = poultry["houses"].get(house_id)
     if not house:
-        return
+        return  # الحظيرة ربما حُذفت بعد جدولة التنبيه
     if not is_today_recorded(house):
         tokens = poultry["tokens"]["managers"] if target == 'manager' else poultry["tokens"]["workers"]
         house_name = house.get("name", "الحظيرة")
@@ -993,6 +976,8 @@ def trigger_custom_alert(house_id, target, title):
         send_push_notification(tokens, title, body)
 
 def reconfigure_scheduler():
+    # نحذف فقط وظائف تنبيهات الحظائر، حتى لا نمسح وظائف بوت تيليجرام
+    # (الاستطلاع الدوري والتقرير اليومي) المسجّلة بشكل منفصل.
     for job in scheduler.get_jobs():
         if job.id.startswith("house_"):
             scheduler.remove_job(job.id)
@@ -1055,7 +1040,7 @@ scheduler.add_job(
     poll_telegram_updates, 'interval', seconds=20,
     id='telegram_poll', replace_existing=True
 )
-# التقرير اليومي - يرسل الساعة 22:00 كل يوم
+# التقرير اليومي - يرسل الساعة 22:00 كل يوم (عدّل الوقت حسب رغبتك)
 scheduler.add_job(
     send_daily_telegram_report, 'cron', hour=22, minute=0,
     id='telegram_daily_report', replace_existing=True
@@ -1142,10 +1127,7 @@ def create_house():
     reconfigure_scheduler()
 
     send_telegram_message(
-        f"🏠 <b>حظيرة جديدة</b>\n"
-        f"الاسم: {name}\n"
-        f"عدد الطيور: {initial_birds_count}\n"
-        f"تاريخ البدء: {start_date}"
+        f"🏠 <b>حظيرة جديدة</b>\nالاسم: {name}\nعدد الطيور: {initial_birds_count}"
     )
 
     return jsonify({
@@ -1163,7 +1145,6 @@ def update_house_info(house_id):
     if not house:
         return jsonify({"status": "error", "message": "الحظيرة غير موجودة!"}), 404
 
-    old_data = house.copy()
     if 'name' in req and req['name']:
         house['name'] = req['name'].strip()
     if 'start_date' in req and req['start_date']:
@@ -1175,17 +1156,7 @@ def update_house_info(house_id):
 
     data["poultry"] = poultry
     save_data(data)
-    
-    changes = []
-    if 'name' in req and old_data.get('name') != house.get('name'):
-        changes.append(f"الاسم: {old_data.get('name')} → {house.get('name')}")
-    if 'initial_birds_count' in req and old_data.get('cycle_info', {}).get('initial_birds_count') != house.get('cycle_info', {}).get('initial_birds_count'):
-        changes.append(f"عدد الطيور: {old_data.get('cycle_info', {}).get('initial_birds_count')} → {house.get('cycle_info', {}).get('initial_birds_count')}")
-    
-    send_telegram_message(
-        "✏️ <b>تعديل بيانات حظيرة</b>\n" +
-        ("\n".join(changes) if changes else f"الاسم: {house.get('name','-')}")
-    )
+    send_telegram_message(f"✏️ <b>تعديل بيانات حظيرة</b>\nالاسم: {house.get('name','-')}")
     return jsonify({"status": "success", "message": "تم تحديث بيانات الحظيرة بنجاح!"})
 
 @app.route('/api/houses/<house_id>', methods=['DELETE'])
@@ -1198,10 +1169,7 @@ def delete_house(house_id):
     data["poultry"] = poultry
     save_data(data)
     reconfigure_scheduler()
-    send_telegram_message(
-        f"🗑️ <b>حذف حظيرة</b>\n"
-        f"الاسم: {deleted_house.get('name','-')}"
-    )
+    send_telegram_message(f"🗑️ <b>حذف حظيرة</b>\nالاسم: {deleted_house.get('name','-')}")
     return jsonify({"status": "success", "message": "تم حذف الحظيرة بنجاح!"})
 
 # --- بيانات لوحة تحكم حظيرة محددة ---
@@ -1249,6 +1217,7 @@ def add_house_record(house_id):
     if not house:
         return jsonify({"status": "error", "message": "الحظيرة غير موجودة!"}), 404
 
+    # ✅ ضمان وجود daily_records حتى لا يحدث KeyError في الحظائر القديمة
     house.setdefault("daily_records", [])
 
     start_date = datetime.strptime(house["cycle_info"]["start_date"], "%Y-%m-%d").date()
@@ -1269,54 +1238,25 @@ def add_house_record(house_id):
         }
         house["daily_records"].append(existing_record)
 
-    changes = []
     if 'morning_mortality' in req:
-        old_val = existing_record.get('morning_mortality', 0)
-        new_val = int(req['morning_mortality'])
-        if old_val != new_val:
-            changes.append(f"نفوق صباحي: {old_val} → {new_val}")
-        existing_record['morning_mortality'] = new_val
+        existing_record['morning_mortality'] = int(req['morning_mortality'])
     if 'evening_mortality' in req:
-        old_val = existing_record.get('evening_mortality', 0)
-        new_val = int(req['evening_mortality'])
-        if old_val != new_val:
-            changes.append(f"نفوق مسائي: {old_val} → {new_val}")
-        existing_record['evening_mortality'] = new_val
+        existing_record['evening_mortality'] = int(req['evening_mortality'])
     if 'avg_weight_g' in req and float(req['avg_weight_g']) > 0:
-        old_val = existing_record.get('avg_weight_g', 0)
-        new_val = float(req['avg_weight_g'])
-        if old_val != new_val:
-            changes.append(f"متوسط الوزن: {old_val} → {new_val} جم")
-        existing_record['avg_weight_g'] = new_val
+        existing_record['avg_weight_g'] = float(req['avg_weight_g'])
     if 'feed_kg' in req and float(req['feed_kg']) > 0:
-        old_val = existing_record.get('feed_kg', 0)
-        new_val = float(req['feed_kg'])
-        if old_val != new_val:
-            changes.append(f"العلف: {old_val} → {new_val} كجم")
-        existing_record['feed_kg'] = new_val
+        existing_record['feed_kg'] = float(req['feed_kg'])
     if 'feed_type' in req and req['feed_type']:
-        old_val = existing_record.get('feed_type', 'بادئ')
-        new_val = req['feed_type']
-        if old_val != new_val:
-            changes.append(f"نوع العلف: {old_val} → {new_val}")
-        existing_record['feed_type'] = new_val
+        existing_record['feed_type'] = req['feed_type']
 
     data["poultry"] = poultry
     save_data(data)
-    
-    if changes:
-        send_telegram_message(
-            "📋 <b>تسجيل يومي - تحديث</b>\n"
-            f"الحظيرة: {house.get('name','-')} (يوم {current_day})\n" +
-            "\n".join(changes)
-        )
-    else:
-        send_telegram_message(
-            "📋 <b>تسجيل يومي جديد</b>\n"
-            f"الحظيرة: {house.get('name','-')} (يوم {current_day})\n"
-            f"نفوق صباحي: {existing_record['morning_mortality']} | نفوق مسائي: {existing_record['evening_mortality']}\n"
-            f"متوسط الوزن: {existing_record['avg_weight_g']} جم | العلف: {existing_record['feed_kg']} كجم ({existing_record['feed_type']})"
-        )
+    send_telegram_message(
+        "📋 <b>تسجيل يومي جديد</b>\n"
+        f"الحظيرة: {house.get('name','-')} (يوم {current_day})\n"
+        f"نفوق صباحي: {existing_record['morning_mortality']} | نفوق مسائي: {existing_record['evening_mortality']}\n"
+        f"متوسط الوزن: {existing_record['avg_weight_g']} جم | العلف: {existing_record['feed_kg']} كجم ({existing_record['feed_type']})"
+    )
     return jsonify({"status": "success", "message": "تم الحفظ بنجاح!"})
 
 @app.route('/api/houses/<house_id>/alerts', methods=['POST'])
@@ -1328,20 +1268,15 @@ def update_house_alerts(house_id):
     if not house:
         return jsonify({"status": "error", "message": "الحظيرة غير موجودة!"}), 404
 
-    old_alerts = house.get("alert_schedules", [])
     house["alert_schedules"] = req.get('alert_schedules', [])
     data["poultry"] = poultry
     save_data(data)
     reconfigure_scheduler()
 
-    # إرسال تفاصيل التنبيهات الجديدة
-    alerts_text = "\n".join([f"• {a.get('time', '')} - {a.get('title', '')} ({a.get('target', '')})" for a in house["alert_schedules"]])
-    send_telegram_message(
-        f"🔔 <b>تحديث تنبيهات حظيرة</b>\n"
-        f"الحظيرة: {house.get('name','-')}\n\n{alerts_text}"
-    )
+    send_telegram_message(f"🔔 <b>تحديث تنبيهات حظيرة</b>\nالحظيرة: {house.get('name','-')}")
 
     return jsonify({"status": "success", "message": "تم تحديث وإضافة تنبيهات الحظيرة بنجاح!"})
+
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1362,14 +1297,14 @@ def add_factory_transaction():
     bags_count = int(req_data.get('bags_count', 0))
     bag_weight = float(req_data.get('bag_weight', 0))
 
+    # حساب إجمالي الوزن بالكيلوجرام المستهدف لهذه العملية
     total_kg = bags_count * bag_weight
 
     data = load_data()
     factory = data["feed_factory"]
 
     if ingredient_key in factory['ingredients']:
-        old_stock = factory['ingredients'][ingredient_key]['stockKg']
-        
+        # تعديل تراكمي للمخزون بالكيلوجرام
         if trans_type == 'وارد':
             factory['ingredients'][ingredient_key]['stockKg'] += total_kg
         elif trans_type == 'منصرف':
@@ -1377,8 +1312,7 @@ def add_factory_transaction():
             if factory['ingredients'][ingredient_key]['stockKg'] < 0:
                 factory['ingredients'][ingredient_key]['stockKg'] = 0
 
-        new_stock = factory['ingredients'][ingredient_key]['stockKg']
-
+        # تسجيل الحركة متضمنة تخصيص الشكائر وأوزانها كمرجع في السجل
         new_log = {
             "id": str(len(factory['history'][ingredient_key]) + 1),
             "date": datetime.now().strftime("%Y/%m/%d %I:%M %p"),
@@ -1397,11 +1331,8 @@ def add_factory_transaction():
             "🌾 <b>حركة مصنع علف جديدة</b>\n"
             f"المكوّن: {ing_name}\n"
             f"النوع: {trans_type}\n"
-            f"عدد الشكائر: {bags_count} × {bag_weight} كجم = {total_kg:,.2f} كجم\n"
-            f"المخزون السابق: {old_stock:,.2f} كجم → المخزون الجديد: {new_stock:,.2f} كجم"
+            f"عدد الشكائر: {bags_count} × {bag_weight} كجم = {total_kg:,.2f} كجم"
         )
-    else:
-        return jsonify({"error": "المكون غير موجود"}), 404
 
     return jsonify(data["feed_factory"])
 
@@ -1411,6 +1342,9 @@ def add_factory_transaction():
 # ══════════════════════════════════════════════════════════════════
 
 def sync_debt_payments_from_bank(data):
+    """يبحث في معاملات إيصالات البنك عن أي معاملة القسم فيها 'الديون' والنوع فيه
+    اسم شخص مسجّل في نظام الديون، ويضيفها تلقائياً كدفعة تُخصم من دين ذلك الشخص
+    (بدون تكرار الخصم لنفس الإيصال مرتين)."""
     debts = data["debts"]
     people = debts["people"]
     if not people:
@@ -1424,6 +1358,7 @@ def sync_debt_payments_from_bank(data):
         if section != "الديون" and "ديون" not in section:
             continue
 
+        # معرّف ثابت لهذه المعاملة البنكية (رقم العملية من الإيصال نفسه)
         source_id = str(bank_tx.get("رقم_العملية", "")).strip()
         if not source_id or source_id in already_synced:
             continue
@@ -1456,14 +1391,6 @@ def sync_debt_payments_from_bank(data):
         debts["transactions"].append(new_tx)
         already_synced.add(source_id)
         changed = True
-        
-        # إرسال إشعار تيليجرام عن الخصم التلقائي
-        send_telegram_message(
-            "💳 <b>خصم تلقائي من الدين</b>\n"
-            f"الشخص: {matched_person.get('name', '-')}\n"
-            f"المبلغ المخصوم: {abs(amount):,.2f}\n"
-            f"من إيصال بنكي رقم: {source_id}"
-        )
 
     if changed:
         debts["synced_bank_tx_ids"] = list(already_synced)
@@ -1477,7 +1404,7 @@ def sync_debt_payments_from_bank(data):
 def get_persons():
     data = load_data()
     sync_debt_payments_from_bank(data)
-    data = load_data()
+    data = load_data()  # إعادة القراءة بعد التزامن للحصول على أحدث نسخة
     debts = data["debts"]
     result = []
     for p in debts["people"]:
@@ -1522,8 +1449,7 @@ def create_person():
     save_data(data)
     send_telegram_message(
         "🧑‍🤝‍🧑 <b>شخص جديد في نظام الديون</b>\n"
-        f"الاسم: {name}\n"
-        f"الهاتف: {phone}"
+        f"الاسم: {name}\nالهاتف: {phone}"
         + (f"\nرصيد ابتدائي: {initial_amount:,.2f}" if initial_amount else "")
     )
     return jsonify(new_person), 201
@@ -1538,8 +1464,7 @@ def delete_person(person_id):
     data["debts"] = debts
     save_data(data)
     send_telegram_message(
-        f"🗑️ <b>حذف شخص من نظام الديون</b>\n"
-        f"الاسم: {deleted_person.get('name','-') if deleted_person else '-'}"
+        f"🗑️ <b>حذف شخص من نظام الديون</b>\nالاسم: {deleted_person.get('name','-') if deleted_person else '-'}"
     )
     return jsonify({"status": "deleted"}), 200
 
@@ -1576,10 +1501,8 @@ def add_debt_transaction():
 
     person = next((p for p in debts["people"] if p["id"] == new_tx["person_id"]), None)
     person_name = person["name"] if person else str(new_tx["person_id"])
-    
-    tx_type = "إضافة رصيد" if float(amount) > 0 else "خصم من الدين"
     send_telegram_message(
-        f"💳 <b>معاملة دين جديدة - {tx_type}</b>\n"
+        "💳 <b>معاملة دين جديدة</b>\n"
         f"الشخص: {person_name}\n"
         f"المبلغ: {new_tx['amount']:,.2f}\n"
         f"ملاحظة: {new_tx.get('note', '-')}"
