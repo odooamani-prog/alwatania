@@ -1517,4 +1517,5 @@ if __name__ == '__main__':
     print(f"📁 ملف البيانات: {DATA_FILE}")
     print("📍 يعمل على المنفذ 5000")
     print("=" * 50)
-    app.run(host='0.0.0.0', port=8080, debug=False)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port, debug=False)
