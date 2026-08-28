@@ -9,6 +9,11 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from apscheduler.schedulers.background import BackgroundScheduler
+from zoneinfo import ZoneInfo
+
+# التوقيت المحلي (توقيت الخرطوم) - عشان جدولة التقرير اليومي والتنبيهات
+# تكون بالساعة المحلية الصحيحة بغض النظر عن توقيت سيرفر الاستضافة (Render يشغّل UTC)
+LOCAL_TZ = ZoneInfo("Africa/Khartoum")
 
 app = Flask(__name__)
 CORS(app)
@@ -405,6 +410,9 @@ def save_transaction_record(new_data):
         "🏦 <b>معاملة بنكية جديدة</b>\n"
         f"المرسل إليه: {new_data.get('اسم_المرسل_إليه', '-')}\n"
         f"المبلغ: {new_data.get('المبلغ', '-')}\n"
+        f"من حساب: {new_data.get('من_حساب', '-')}\n"
+        f"الى حساب: {new_data.get('الى_حساب', '-')}\n"
+        f"رقم العملية: {new_data.get('رقم_العملية', '-')}\n"
         f"القسم: {new_data.get('القسم', '-')} | النوع: {new_data.get('النوع', '-')}\n"
         f"التاريخ: {new_data.get('التاريخ_والزمن', '-')}"
     )
@@ -492,10 +500,10 @@ def poll_telegram_updates():
         print("❌ خطأ أثناء استطلاع تحديثات تيليجرام:", e)
 
 def send_daily_telegram_report():
-    """يبني ويرسل تقريرًا يوميًا موجزًا بكل المعاملات (بنكية / ديون / مصنع علف)."""
+    """يبني ويرسل تقريرًا يوميًا شاملاً: معاملات بنكية / ديون / مصنع علف / نفوق وعلف الحظائر."""
     try:
         data = load_data()
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
 
         bank_txs = [t for t in data.get("transactions", [])
                     if str(t.get("وقت_الحفظ", "")).startswith(today_str) and "error" not in t]
@@ -507,24 +515,54 @@ def send_daily_telegram_report():
 
         factory = data.get("feed_factory", {})
         today_factory_moves = []
-        today_slash = datetime.now().strftime("%Y/%m/%d")
+        today_slash = datetime.now(LOCAL_TZ).strftime("%Y/%m/%d")
         for ing_key, logs in factory.get("history", {}).items():
             for log in logs:
                 if str(log.get("date", "")).startswith(today_slash):
                     today_factory_moves.append((ing_key, log))
 
+        # ─ ملخص الحظائر: النفوق واستهلاك العلف لليوم ─
+        poultry = data.get("poultry", {})
+        houses = poultry.get("houses", {})
+        total_mortality_today = 0
+        total_feed_today = 0.0
+        house_lines = []
+        for house_id, house in houses.items():
+            today_record = next(
+                (r for r in house.get("daily_records", []) if r.get("date") == today_str),
+                None
+            )
+            if not today_record:
+                continue
+            house_mortality = today_record.get("morning_mortality", 0) + today_record.get("evening_mortality", 0)
+            house_feed = float(today_record.get("feed_kg", 0))
+            total_mortality_today += house_mortality
+            total_feed_today += house_feed
+            if house_mortality > 0 or house_feed > 0:
+                house_lines.append(
+                    f"  • {house.get('name', house_id)}: نفوق {house_mortality} | "
+                    f"وزن {today_record.get('avg_weight_g', 0)} جم | علف {house_feed:,.0f} كجم"
+                )
+
         lines = [f"📊 <b>التقرير اليومي</b> - {today_str}", ""]
         lines.append(f"🏦 معاملات بنكية: {len(bank_txs)} | إجمالي المبالغ: {total_bank_amount:,.2f}")
         lines.append(f"💳 حركات ديون: {len(today_debt_txs)}")
         lines.append(f"🌾 حركات مصنع العلف: {len(today_factory_moves)}")
-
-        if not bank_txs and not today_debt_txs and not today_factory_moves:
+        lines.append("")
+        lines.append(f"🐔 إجمالي النفوق اليوم (كل الحظائر): {total_mortality_today}")
+        lines.append(f"🌽 إجمالي العلف المستهلك اليوم: {total_feed_today:,.0f} كجم")
+        if house_lines:
             lines.append("")
-            lines.append("لا توجد أي معاملات مسجّلة اليوم.")
+            lines.append("<b>تفصيل الحظائر:</b>")
+            lines.extend(house_lines)
+
+        if not bank_txs and not today_debt_txs and not today_factory_moves and total_mortality_today == 0 and total_feed_today == 0:
+            lines.append("")
+            lines.append("لا توجد أي معاملات أو تسجيلات مرتبطة اليوم.")
 
         send_telegram_message("\n".join(lines))
     except Exception as e:
-        print("خطأ أثناء إنشاء/إرسال التقرير اليومي:", e)
+        print("❌ خطأ أثناء إنشاء/إرسال التقرير اليومي:", e)
 
 
 @app.route('/', methods=['GET'])
@@ -958,7 +996,7 @@ def is_today_recorded(house):
                 return True
     return False
 
-scheduler = BackgroundScheduler()
+scheduler = BackgroundScheduler(timezone=LOCAL_TZ)
 
 def trigger_custom_alert(house_id, target, title):
     data = load_data()
