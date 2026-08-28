@@ -9,11 +9,19 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from apscheduler.schedulers.background import BackgroundScheduler
-from zoneinfo import ZoneInfo
 
-# التوقيت المحلي (توقيت الخرطوم) - عشان جدولة التقرير اليومي والتنبيهات
-# تكون بالساعة المحلية الصحيحة بغض النظر عن توقيت سيرفر الاستضافة (Render يشغّل UTC)
-LOCAL_TZ = ZoneInfo("Africa/Khartoum")
+# التوقيت المحلي (توقيت الخرطوم) - عشان جدولة التقرير اليومي تكون بالساعة
+# المحلية الصحيحة بغض النظر عن توقيت سيرفر الاستضافة (Render يشغّل UTC).
+# محاط بـ try/except لأن بعض بيئات الاستضافة (صور Docker المصغّرة) ما
+# تجي فيها بيانات المناطق الزمنية (tzdata) بشكل افتراضي، ولو صار خطأ هنا
+# بدون حماية فالتطبيق كله كان يفشل بالإقلاع بصمت (وهذا سبب توقف كل الرسائل).
+try:
+    from zoneinfo import ZoneInfo
+    LOCAL_TZ = ZoneInfo("Africa/Khartoum")
+except Exception as e:
+    print(f"⚠️ تعذّر تحميل التوقيت المحلي (Africa/Khartoum): {e} — "
+          f"سيتم استخدام UTC، وأضف 'tzdata' لملف requirements.txt لحل هذا.")
+    LOCAL_TZ = None
 
 app = Flask(__name__)
 CORS(app)
@@ -1083,6 +1091,13 @@ scheduler.add_job(
     send_daily_telegram_report, 'cron', hour=22, minute=0,
     id='telegram_daily_report', replace_existing=True
 )
+
+# استطلاع فوري عند الإقلاع (بدل انتظار 20 ثانية) ثم رسالة تأكيد أن السيرفر اشتغل
+try:
+    poll_telegram_updates()
+    send_telegram_message("✅ <b>السيرفر اشتغل بنجاح</b> وجاهز الآن لاستقبال العمليات.")
+except Exception as e:
+    print("❌ خطأ أثناء إرسال رسالة بدء التشغيل لتيليجرام:", e)
 
 # --- إعدادات التطبيق العامة (تُضبط مرة واحدة فقط) ---
 
