@@ -9,7 +9,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from apscheduler.schedulers.background import BackgroundScheduler
-import time
+
 # التوقيت المحلي (توقيت الخرطوم) - عشان جدولة التقرير اليومي تكون بالساعة
 # المحلية الصحيحة بغض النظر عن توقيت سيرفر الاستضافة (Render يشغّل UTC).
 # محاط بـ try/except لأن بعض بيئات الاستضافة (صور Docker المصغّرة) ما
@@ -536,7 +536,7 @@ def poll_telegram_updates():
         print("❌ خطأ أثناء استطلاع تحديثات تيليجرام:", e)
 
 def send_daily_telegram_report():
-    """يبني ويرسل تقريرًا يوميًا شاملاً: معاملات بنكية / ديون / مصنع علف / نفوق وعلف الحظائر ثم يتبعها بملف النسخة الاحتياطية."""
+    """يبني ويرسل تقريرًا يوميًا شاملاً: معاملات بنكية / ديون / مصنع علف / نفوق وعلف الحظائر."""
     try:
         data = load_data()
         today_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
@@ -557,7 +557,7 @@ def send_daily_telegram_report():
                 if str(log.get("date", "")).startswith(today_slash):
                     today_factory_moves.append((ing_key, log))
 
-        # ملخص الحظائر: النفوق واستهلاك العلف لليوم
+        # ─ ملخص الحظائر: النفوق واستهلاك العلف لليوم ─
         poultry = data.get("poultry", {})
         houses = poultry.get("houses", {})
         total_mortality_today = 0
@@ -596,23 +596,16 @@ def send_daily_telegram_report():
             lines.append("")
             lines.append("لا توجد أي معاملات أو تسجيلات مرتبطة اليوم.")
 
-        # 1. إرسال نص التقرير اليومي
         send_telegram_message("\n".join(lines))
 
-        # الانتظار ثانيتين لتجنب تضارب الطلبات في Telegram API
-        time.sleep(2)
-
-        # 2. إرسال ملف البيانات data.json كنسخة احتياطية
-        try:
-            send_telegram_document(
-                DATA_FILE,
-                caption=f"🗄️ نسخة احتياطية من data.json - {today_str}"
-            )
-        except Exception as file_err:
-            print("❌ خطأ أثناء إرسال ملف النسخة الاحتياطية:", file_err)
-
+        # نسخة احتياطية يومية من ملف البيانات كاملاً بعد التقرير مباشرة
+        send_telegram_document(
+            DATA_FILE,
+            caption=f"🗄️ نسخة احتياطية من data.json - {today_str}"
+        )
     except Exception as e:
         print("❌ خطأ أثناء إنشاء/إرسال التقرير اليومي:", e)
+
 
 @app.route('/', methods=['GET'])
 def home():
