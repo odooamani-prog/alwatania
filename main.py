@@ -4,6 +4,7 @@ import re
 import os
 import base64
 import uuid
+import time
 from datetime import datetime, date
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -45,6 +46,10 @@ EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send'
 # ─── بوت تيليجرام (تقارير وإشعارات المعاملات) ──────────────────────
 TELEGRAM_BOT_TOKEN = config.get("TELEGRAM_BOT_TOKEN") or "8934774619:AAEELQfe6o5q6Lwe9FPApcM4zK1NQPsMJwQ"
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
+
+# ─── بوت تيليجرام ثانٍ مستقل، مخصّص فقط لإرسال صور الإيصالات بعد حفظها (@BOK_nvoices_bot) ───
+TELEGRAM_IMAGE_BOT_TOKEN = config.get("TELEGRAM_IMAGE_BOT_TOKEN") or "8420107114:AAHK8ValuI-4RA1qYpN3juC_r9nt5HeK3SE"
+TELEGRAM_IMAGE_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_IMAGE_BOT_TOKEN}"
 
 # ─── ملف بيانات واحد موحّد لكل شيء ──────────────────────────────────
 # (جهات الاتصال + العمال + المعاملات البنكية + بيانات مزرعة الدواجن)
@@ -128,6 +133,12 @@ def default_telegram():
         "update_offset": 0
     }
 
+def default_telegram_images():
+    return {
+        "chat_ids": [],
+        "update_offset": 0
+    }
+
 def default_data():
     return {
         "contacts": [dict(c) for c in DEFAULT_CONTACTS],
@@ -136,7 +147,8 @@ def default_data():
         "poultry": default_poultry(),
         "feed_factory": default_feed_factory(),
         "debts": default_debts(),
-        "telegram": default_telegram()
+        "telegram": default_telegram(),
+        "telegram_images": default_telegram_images()
     }
 
 def load_data():
@@ -163,7 +175,7 @@ def load_data():
         print(f"⚠️  تم حفظ نسخة منه في: {backup_path}")
         print("⚠️  تم البدء بقاعدة بيانات فارغة (وليست البيانات التجريبية الافتراضية)")
         print("=" * 50)
-        data = {"contacts": [], "workers": [], "transactions": [], "poultry": default_poultry(), "feed_factory": default_feed_factory(), "debts": default_debts(), "telegram": default_telegram()}
+        data = {"contacts": [], "workers": [], "transactions": [], "poultry": default_poultry(), "feed_factory": default_feed_factory(), "debts": default_debts(), "telegram": default_telegram(), "telegram_images": default_telegram_images()}
         save_data(data)
         return data
 
@@ -209,6 +221,13 @@ def load_data():
         t = data["telegram"]
         t.setdefault("chat_ids", [])
         t.setdefault("update_offset", 0)
+    if "telegram_images" not in data:
+        data["telegram_images"] = default_telegram_images()
+        changed = True
+    else:
+        ti = data["telegram_images"]
+        ti.setdefault("chat_ids", [])
+        ti.setdefault("update_offset", 0)
     if changed:
         save_data(data)
     return data
@@ -425,6 +444,27 @@ def save_transaction_record(new_data):
         f"التاريخ: {new_data.get('التاريخ_والزمن', '-')}"
     )
 
+    # إرسال صورة الإيصال نفسها لبوت الصور المستقل @BOK_nvoices_bot، فقط بعد
+    # نجاح الحفظ أعلاه. يعتمد على وصول حقل "file_name" ضمن بيانات الحفظ (وهو
+    # نفس الاسم الذي يرجعه /dashboard/api/ocr/upload) - لو التطبيق لا يعيد
+    # إرسال هذا الحقل عند الحفظ، لن تُرسل صورة (بدون أي خطأ أو تعطيل للحفظ).
+    file_name = new_data.get("file_name")
+    if file_name:
+        image_path = os.path.join(app.config['UPLOAD_FOLDER'], file_name)
+        send_telegram_photo(
+            image_path,
+            caption=(
+                "🧾 صورة الإيصال المحفوظ\n"
+                f"المرسل إليه: {new_data.get('اسم_المرسل_إليه', '-')}\n"
+                f"المبلغ: {new_data.get('المبلغ', '-')}\n"
+                f"من حساب: {new_data.get('من_حساب', '-')}\n"
+                f"الى حساب: {new_data.get('الى_حساب', '-')}\n"
+                f"رقم العملية: {new_data.get('رقم_العملية', '-')}\n"
+                f"القسم: {new_data.get('القسم', '-')} | النوع: {new_data.get('النوع', '-')}\n"
+                f"التاريخ: {new_data.get('التاريخ_والزمن', '-')}"
+            )
+        )
+
     return len(transactions), transactions[-1]["id"]
 
 
@@ -483,6 +523,41 @@ def send_telegram_document(file_path, caption=""):
         except Exception as e:
             print(f"❌ استثناء أثناء إرسال الملف للمحادثة {chat_id}:", e)
 
+def get_telegram_image_chat_ids():
+    """يرجع قائمة كل المحادثات المسجّلة في بوت الصور (اللي بعتت /start له)."""
+    try:
+        data = load_data()
+        return list(data.get("telegram_images", {}).get("chat_ids", []))
+    except Exception as e:
+        print("❌ خطأ أثناء قراءة بيانات بوت الصور:", e)
+        return []
+
+def send_telegram_photo(image_path, caption=""):
+    """يرسل صورة (صورة الإيصال بعد حفظ معاملته) لكل المحادثات المسجّلة في بوت
+    الصور المستقل @BOK_nvoices_bot - منفصل تمامًا عن بوت التقارير النصية."""
+    chat_ids = get_telegram_image_chat_ids()
+    if not chat_ids:
+        print("⚠️ لم يتم إرسال الصورة: لا توجد أي محادثة مسجّلة في بوت الصور بعد "
+              "(لازم ترسل /start للبوت @BOK_nvoices_bot أولاً).")
+        return
+    if not image_path or not os.path.exists(image_path):
+        print(f"❌ لم يتم إرسال الصورة: المسار غير موجود {image_path}")
+        return
+    for chat_id in chat_ids:
+        try:
+            with open(image_path, "rb") as f:
+                resp = requests.post(
+                    f"{TELEGRAM_IMAGE_API_BASE}/sendPhoto",
+                    data={"chat_id": chat_id, "caption": caption},
+                    files={"photo": (os.path.basename(image_path), f)},
+                    timeout=30
+                )
+            if resp.status_code != 200:
+                print(f"❌ فشل إرسال الصورة للمحادثة {chat_id}: "
+                      f"{resp.status_code} - {resp.text}")
+        except Exception as e:
+            print(f"❌ استثناء أثناء إرسال الصورة للمحادثة {chat_id}:", e)
+
 def poll_telegram_updates():
     """يستطلع تحديثات البوت بشكل دوري لتسجيل أي محادثة جديدة بعتت /start،
     بدل الحاجة لإدخال chat_id يدويًا. يخزن آخر update_id عشان ما يعالج
@@ -534,6 +609,57 @@ def poll_telegram_updates():
             save_data(data)
     except Exception as e:
         print("❌ خطأ أثناء استطلاع تحديثات تيليجرام:", e)
+
+def poll_telegram_image_updates():
+    """نفس فكرة poll_telegram_updates لكن لبوت الصور @BOK_nvoices_bot بشكل مستقل
+    تمامًا: توكن مختلف، قائمة محادثات مختلفة (telegram_images)، و update_offset خاص به."""
+    try:
+        data = load_data()
+        ti = data.setdefault("telegram_images", default_telegram_images())
+        offset = ti.get("update_offset", 0)
+
+        resp = requests.get(
+            f"{TELEGRAM_IMAGE_API_BASE}/getUpdates",
+            params={"offset": offset + 1, "timeout": 5},
+            timeout=15
+        )
+        if resp.status_code != 200:
+            print(f"❌ فشل استطلاع تحديثات بوت الصور: {resp.status_code} - {resp.text}")
+            return
+
+        updates = resp.json().get("result", [])
+        if not updates:
+            return
+
+        changed = False
+        for update in updates:
+            ti["update_offset"] = update["update_id"]
+            changed = True
+            msg = update.get("message") or update.get("channel_post")
+            if not msg:
+                continue
+            chat_id = msg.get("chat", {}).get("id")
+            if chat_id is None:
+                continue
+            if chat_id not in ti["chat_ids"]:
+                ti["chat_ids"].append(chat_id)
+                try:
+                    requests.post(
+                        f"{TELEGRAM_IMAGE_API_BASE}/sendMessage",
+                        json={
+                            "chat_id": chat_id,
+                            "text": "✅ تم تفعيل استلام صور الإيصالات المحفوظة على هذه المحادثة."
+                        },
+                        timeout=10
+                    )
+                except Exception:
+                    pass
+
+        if changed:
+            data["telegram_images"] = ti
+            save_data(data)
+    except Exception as e:
+        print("❌ خطأ أثناء استطلاع تحديثات بوت الصور:", e)
 
 def send_daily_telegram_report():
     """يبني ويرسل تقريرًا يوميًا شاملاً: معاملات بنكية / ديون / مصنع علف / نفوق وعلف الحظائر ثم يتبعها بملف النسخة الاحتياطية."""
@@ -633,7 +759,9 @@ def home():
             "telegram_status": "/api/telegram/status",
             "telegram_send_test": "/api/telegram/test",
             "telegram_send_daily_report_now": "/api/telegram/report/send",
-            "telegram_poll_now": "/api/telegram/poll_now"
+            "telegram_poll_now": "/api/telegram/poll_now",
+            "telegram_images_status": "/api/telegram/images/status",
+            "telegram_images_poll_now": "/api/telegram/images/poll_now"
         }
     })
 
@@ -693,6 +821,45 @@ def telegram_poll_now():
         "success": True,
         "registered_chats": len(tg.get("chat_ids", [])),
         "chat_ids": tg.get("chat_ids", [])
+    })
+
+# --- بوت الصور @BOK_nvoices_bot: حالة ومحادثات مسجّلة + استطلاع يدوي ---
+
+@app.route('/api/telegram/images/status', methods=['GET'])
+def telegram_images_status():
+    data = load_data()
+    ti = data.get("telegram_images", default_telegram_images())
+
+    bot_info = None
+    bot_error = None
+    try:
+        resp = requests.get(f"{TELEGRAM_IMAGE_API_BASE}/getMe", timeout=10)
+        if resp.status_code == 200:
+            bot_info = resp.json().get("result")
+        else:
+            bot_error = f"{resp.status_code} - {resp.text}"
+    except Exception as e:
+        bot_error = str(e)
+
+    return jsonify({
+        "success": True,
+        "registered_chats": len(ti.get("chat_ids", [])),
+        "chat_ids": ti.get("chat_ids", []),
+        "bot_info": bot_info,
+        "bot_connection_error": bot_error
+    })
+
+@app.route('/api/telegram/images/poll_now', methods=['POST'])
+def telegram_images_poll_now():
+    """استطلاع فوري يدوي لتحديثات بوت الصور - مفيد للتشخيص لو المحادثة
+    ما تسجّلت تلقائيًا بعد إرسال /start للبوت @BOK_nvoices_bot."""
+    poll_telegram_image_updates()
+    data = load_data()
+    ti = data.get("telegram_images", default_telegram_images())
+    return jsonify({
+        "success": True,
+        "registered_chats": len(ti.get("chat_ids", [])),
+        "chat_ids": ti.get("chat_ids", [])
     })
 
 # --- جهات الاتصال ---
@@ -1155,6 +1322,11 @@ scheduler.add_job(
     poll_telegram_updates, 'interval', seconds=20,
     id='telegram_poll', replace_existing=True
 )
+# استطلاع دوري مستقل لبوت الصور @BOK_nvoices_bot لتسجيل أي محادثة جديدة بعتت /start له
+scheduler.add_job(
+    poll_telegram_image_updates, 'interval', seconds=20,
+    id='telegram_image_poll', replace_existing=True
+)
 # التقرير اليومي - يرسل الساعة 22:00 كل يوم (عدّل الوقت حسب رغبتك)
 scheduler.add_job(
     send_daily_telegram_report, 'cron', hour=22, minute=0,
@@ -1178,6 +1350,18 @@ try:
     )
 except Exception as e:
     print("❌ خطأ أثناء إرسال رسالة بدء التشغيل لتيليجرام:", e)
+
+# نفس خطوة الأمان أعلاه لكن لبوت الصور @BOK_nvoices_bot (توكن مستقل تمامًا عن بوت التقارير)
+try:
+    wh_resp_img = requests.get(f"{TELEGRAM_IMAGE_API_BASE}/deleteWebhook", timeout=10)
+    print(f"ℹ️ حذف webhook بوت الصور (إن وُجد): {wh_resp_img.status_code} - {wh_resp_img.text}")
+except Exception as e:
+    print("❌ تعذّر التحقق من/حذف webhook بوت الصور:", e)
+
+try:
+    poll_telegram_image_updates()
+except Exception as e:
+    print("❌ خطأ أثناء الاستطلاع الأولي لبوت الصور:", e)
 
 # --- إعدادات التطبيق العامة (تُضبط مرة واحدة فقط) ---
 
