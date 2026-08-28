@@ -9,7 +9,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from apscheduler.schedulers.background import BackgroundScheduler
-
+import time
 # التوقيت المحلي (توقيت الخرطوم) - عشان جدولة التقرير اليومي تكون بالساعة
 # المحلية الصحيحة بغض النظر عن توقيت سيرفر الاستضافة (Render يشغّل UTC).
 # محاط بـ try/except لأن بعض بيئات الاستضافة (صور Docker المصغّرة) ما
