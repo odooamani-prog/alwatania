@@ -10,7 +10,11 @@ from flask_cors import CORS
 from werkzeug.utils import secure_filename
 from apscheduler.schedulers.background import BackgroundScheduler
 
-# التوقيت المحلي (توقيت الخرطوم)
+# التوقيت المحلي (توقيت الخرطوم) - عشان جدولة التقرير اليومي تكون بالساعة
+# المحلية الصحيحة بغض النظر عن توقيت سيرفر الاستضافة (Render يشغّل UTC).
+# محاط بـ try/except لأن بعض بيئات الاستضافة (صور Docker المصغّرة) ما
+# تجي فيها بيانات المناطق الزمنية (tzdata) بشكل افتراضي، ولو صار خطأ هنا
+# بدون حماية فالتطبيق كله كان يفشل بالإقلاع بصمت (وهذا سبب توقف كل الرسائل).
 try:
     from zoneinfo import ZoneInfo
     LOCAL_TZ = ZoneInfo("Africa/Khartoum")
@@ -41,12 +45,16 @@ EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send'
 # ─── بوت تيليجرام (تقارير وإشعارات المعاملات) ──────────────────────
 TELEGRAM_BOT_TOKEN = config.get("TELEGRAM_BOT_TOKEN") or "8934774619:AAEELQfe6o5q6Lwe9FPApcM4zK1NQPsMJwQ"
 TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
-# ─── بوت تيليجرام (خاص بإرسال صور الإشعارات) ──────────────────────
-IMAGE_BOT_TOKEN = config.get("IMAGE_BOT_TOKEN") or "8420107114:AAHK8ValuI-4RA1qYpN3juC_r9nt5HeK3SE"[cite: 1]
-IMAGE_BOT_API_BASE = f"https://api.telegram.org/bot{IMAGE_BOT_TOKEN}"
+# chat_id ثابت (اختياري) يُقرأ من متغيّر بيئة أو config.json، ويُستخدم دائمًا
+# بالإضافة لأي محادثات مسجَّلة ديناميكيًا عبر /start. الفايدة: حتى لو الاستضافة
+# مسحت data.json عند إعادة التشغيل (تخزين مؤقت/ephemeral)، الرسائل تستمر توصل
+# على نفس الـ chat_id بدون الحاجة تضغط /start من جديد كل مرة.
+TELEGRAM_FIXED_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or config.get("TELEGRAM_CHAT_ID")
 
 # ─── ملف بيانات واحد موحّد لكل شيء ──────────────────────────────────
+# (جهات الاتصال + العمال + المعاملات البنكية + بيانات مزرعة الدواجن)
+# مسار مطلق بناءً على مكان هذا الملف نفسه - يضمن إنه دائمًا نفس الملف
+# بغض النظر عن المجلد اللي تشغّل منه "python merged_app.py"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(BASE_DIR, "data.json")
 
@@ -137,6 +145,11 @@ def default_data():
     }
 
 def load_data():
+    """تحميل ملف البيانات الموحّد. ينشئه بالقيم الافتراضية فقط إذا لم يكن
+    موجودًا إطلاقًا. لو الملف موجود لكن تالف/فيه خطأ قراءة، لا يتم أبدًا
+    استبدال بياناتك الحقيقية بالبيانات الافتراضية بصمت - بدلاً من ذلك يتم
+    أخذ نسخة احتياطية من الملف التالف وإرجاع بيانات فارغة مع رسالة واضحة
+    في الطرفية عشان تلاحظ المشكلة فورًا."""
     if not os.path.exists(DATA_FILE):
         data = default_data()
         save_data(data)
@@ -159,6 +172,7 @@ def load_data():
         save_data(data)
         return data
 
+    # التأكد من وجود كل الأقسام حتى لو الملف قديم/ناقص (بدون مسح أي قسم موجود)
     changed = False
     if "contacts" not in data:
         data["contacts"] = []
@@ -205,12 +219,16 @@ def load_data():
     return data
 
 def save_data(data):
+    """كتابة ذرية (atomic write): يكتب لملف مؤقت ثم يستبدل الملف الأصلي
+    دفعة واحدة، عشان أي انقطاع أثناء الكتابة (تصادم طلبات متزامنة) ما
+    يخرّب الملف ويخلي القراءة القادمة تفشل."""
     tmp_path = DATA_FILE + ".tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
     os.replace(tmp_path, DATA_FILE)
 
 def renumber(items):
+    """إعادة ترقيم العناصر بأرقام بسيطة متسلسلة 1، 2، 3 ..."""
     for idx, item in enumerate(items, start=1):
         item["id"] = str(idx)
     return items
@@ -415,17 +433,31 @@ def save_transaction_record(new_data):
     return len(transactions), transactions[-1]["id"]
 
 
-# ─── دوال بوت تيليجرام للأشعار والتصاوير ────────────────────
+# ─── دوال بوت تيليجرام (@Alwatania_Reports_bot) ────────────────────
 
-def send_telegram_message(text):
+def get_telegram_chat_ids():
+    """يجمع بين الـ chat_id الثابت (env/config) وأي محادثات اتسجّلت ديناميكيًا،
+    مع إزالة التكرار."""
+    ids = []
+    if TELEGRAM_FIXED_CHAT_ID:
+        ids.append(str(TELEGRAM_FIXED_CHAT_ID))
     try:
         data = load_data()
-        chat_ids = data.get("telegram", {}).get("chat_ids", [])
+        dynamic_ids = data.get("telegram", {}).get("chat_ids", [])
+        for cid in dynamic_ids:
+            if str(cid) not in ids:
+                ids.append(str(cid))
     except Exception as e:
         print("❌ خطأ أثناء قراءة بيانات تيليجرام:", e)
-        return
+    return ids
+
+def send_telegram_message(text):
+    """يرسل رسالة نصية لكل المحادثات (الثابتة + المسجّلة ديناميكيًا عبر /start)."""
+    chat_ids = get_telegram_chat_ids()
     if not chat_ids:
-        print("⚠️ لم يتم إرسال رسالة تيليجرام: لا توجد أي محادثة مسجّلة بعد.")
+        print("⚠️ لم يتم إرسال رسالة تيليجرام: لا توجد أي محادثة مسجّلة بعد. "
+              "إما أرسل /start للبوت @Alwatania_Reports_bot، أو اضبط "
+              "متغيّر البيئة TELEGRAM_CHAT_ID برقم المحادثة الثابت.")
         return
     for chat_id in chat_ids:
         try:
@@ -440,30 +472,34 @@ def send_telegram_message(text):
         except Exception as e:
             print(f"❌ استثناء أثناء إرسال رسالة تيليجرام للمحادثة {chat_id}:", e)
 
-# ─── دالة إرسال صور الإشعارات لبوت الصور ──────────────────
-def send_telegram_photo(filepath, caption=""):
-    """دالة جديدة لإرسال صور الإشعارات المرفوعة إلى بوت التليجرام الخاص بالصور"""
-    try:
-        data = load_data()
-        chat_ids = data.get("telegram", {}).get("chat_ids", [])
-        if not chat_ids:
-            print("⚠️ لم يتم إرسال الصورة: لا توجد أي محادثة مسجّلة بعد.")
-            return
-
-        for chat_id in chat_ids:
-            with open(filepath, 'rb') as photo:
+def send_telegram_document(file_path, caption=""):
+    """يرسل ملفًا (مثل نسخة احتياطية من data.json) لكل المحادثات المسجّلة."""
+    chat_ids = get_telegram_chat_ids()
+    if not chat_ids:
+        print("⚠️ لم يتم إرسال الملف: لا توجد أي محادثة مسجّلة بعد.")
+        return
+    if not os.path.exists(file_path):
+        print(f"❌ لم يتم إرسال الملف: المسار غير موجود {file_path}")
+        return
+    for chat_id in chat_ids:
+        try:
+            with open(file_path, "rb") as f:
                 resp = requests.post(
-                    f"{IMAGE_BOT_API_BASE}/sendPhoto",
+                    f"{TELEGRAM_API_BASE}/sendDocument",
                     data={"chat_id": chat_id, "caption": caption},
-                    files={"photo": photo},
-                    timeout=20
+                    files={"document": (os.path.basename(file_path), f)},
+                    timeout=30
                 )
-                if resp.status_code != 200:
-                    print(f"❌ فشل إرسال الصورة للمحادثة {chat_id}: {resp.status_code} - {resp.text}")
-    except Exception as e:
-        print(f"❌ استثناء أثناء إرسال الصورة لبوت التليجرام:", e)
+            if resp.status_code != 200:
+                print(f"❌ فشل إرسال الملف للمحادثة {chat_id}: "
+                      f"{resp.status_code} - {resp.text}")
+        except Exception as e:
+            print(f"❌ استثناء أثناء إرسال الملف للمحادثة {chat_id}:", e)
 
 def poll_telegram_updates():
+    """يستطلع تحديثات البوت بشكل دوري لتسجيل أي محادثة جديدة بعتت /start،
+    بدل الحاجة لإدخال chat_id يدويًا. يخزن آخر update_id عشان ما يعالج
+    نفس الرسالة مرتين."""
     try:
         data = load_data()
         tg = data.setdefault("telegram", default_telegram())
@@ -513,6 +549,7 @@ def poll_telegram_updates():
         print("❌ خطأ أثناء استطلاع تحديثات تيليجرام:", e)
 
 def send_daily_telegram_report():
+    """يبني ويرسل تقريرًا يوميًا شاملاً: معاملات بنكية / ديون / مصنع علف / نفوق وعلف الحظائر."""
     try:
         data = load_data()
         today_str = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
@@ -533,6 +570,7 @@ def send_daily_telegram_report():
                 if str(log.get("date", "")).startswith(today_slash):
                     today_factory_moves.append((ing_key, log))
 
+        # ─ ملخص الحظائر: النفوق واستهلاك العلف لليوم ─
         poultry = data.get("poultry", {})
         houses = poultry.get("houses", {})
         total_mortality_today = 0
@@ -572,6 +610,12 @@ def send_daily_telegram_report():
             lines.append("لا توجد أي معاملات أو تسجيلات مرتبطة اليوم.")
 
         send_telegram_message("\n".join(lines))
+
+        # نسخة احتياطية يومية من ملف البيانات كاملاً بعد التقرير مباشرة
+        send_telegram_document(
+            DATA_FILE,
+            caption=f"🗄️ نسخة احتياطية من data.json - {today_str}"
+        )
     except Exception as e:
         print("❌ خطأ أثناء إنشاء/إرسال التقرير اليومي:", e)
 
@@ -619,7 +663,7 @@ def telegram_test():
     if chat_count == 0:
         return jsonify({
             "success": False,
-            "error": "لا توجد أي محادثة مسجّلة بعد. أرسل /start للبوت أولاً."
+            "error": "لا توجد أي محادثة مسجّلة بعد. أرسل /start للبوت @Alwatania_Reports_bot أولاً."
         }), 400
     send_telegram_message(text)
     return jsonify({"success": True, "sent_to": chat_count})
@@ -825,9 +869,6 @@ def upload_and_ocr():
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(filepath)
 
-        # ── الإضافة: إرسال صورة الإشعار تلقائياً للبوت المخصص للصور ──
-        send_telegram_photo(filepath, caption="🖼️ صورة إشعار جديدة تم رفعها للسيرفر")
-
         try:
             raw_text, groq_dict = ocr_image_groq(filepath)
         except Exception as e:
@@ -1017,7 +1058,7 @@ def trigger_custom_alert(house_id, target, title):
     poultry = data["poultry"]
     house = poultry["houses"].get(house_id)
     if not house:
-        return
+        return  # الحظيرة ربما حُذفت بعد جدولة التنبيه
     if not is_today_recorded(house):
         tokens = poultry["tokens"]["managers"] if target == 'manager' else poultry["tokens"]["workers"]
         house_name = house.get("name", "الحظيرة")
@@ -1028,6 +1069,8 @@ def trigger_custom_alert(house_id, target, title):
         send_push_notification(tokens, title, body)
 
 def reconfigure_scheduler():
+    # نحذف فقط وظائف تنبيهات الحظائر، حتى لا نمسح وظائف بوت تيليجرام
+    # (الاستطلاع الدوري والتقرير اليومي) المسجّلة بشكل منفصل.
     for job in scheduler.get_jobs():
         if job.id.startswith("house_"):
             scheduler.remove_job(job.id)
@@ -1085,22 +1128,28 @@ def build_house_summary(house_id, house):
 reconfigure_scheduler()
 scheduler.start()
 
+# استطلاع دوري لتسجيل أي محادثة جديدة بعتت /start للبوت
 scheduler.add_job(
     poll_telegram_updates, 'interval', seconds=20,
     id='telegram_poll', replace_existing=True
 )
+# التقرير اليومي - يرسل الساعة 22:00 كل يوم (عدّل الوقت حسب رغبتك)
 scheduler.add_job(
     send_daily_telegram_report, 'cron', hour=22, minute=0,
     id='telegram_daily_report', replace_existing=True
 )
 
+# استطلاع فوري عند الإقلاع (بدل انتظار 20 ثانية) ثم رسالة تأكيد أن السيرفر اشتغل
 try:
     poll_telegram_updates()
-    send_telegram_message("✅ <b>السيرفر اشتغل بنجاح</b> وجاهز الآن لاستقبال العمليات.")
+    send_telegram_message(
+        "✅ <b>السيرفر جاهز ويعمل بكفاءة</b>\n"
+        f"تم تشغيل النظام بنجاح في {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M:%S') if LOCAL_TZ else datetime.now().strftime('%Y-%m-%d %H:%M:%S')}."
+    )
 except Exception as e:
     print("❌ خطأ أثناء إرسال رسالة بدء التشغيل لتيليجرام:", e)
 
-# --- إعدادات التطبيق العامة ---
+# --- إعدادات التطبيق العامة (تُضبط مرة واحدة فقط) ---
 
 @app.route('/api/app_settings', methods=['GET'])
 def get_app_settings():
@@ -1271,6 +1320,7 @@ def add_house_record(house_id):
     if not house:
         return jsonify({"status": "error", "message": "الحظيرة غير موجودة!"}), 404
 
+    # ✅ ضمان وجود daily_records حتى لا يحدث KeyError في الحظائر القديمة
     house.setdefault("daily_records", [])
 
     start_date = datetime.strptime(house["cycle_info"]["start_date"], "%Y-%m-%d").date()
@@ -1331,8 +1381,9 @@ def update_house_alerts(house_id):
     return jsonify({"status": "success", "message": "تم تحديث وإضافة تنبيهات الحظيرة بنجاح!"})
 
 
+
 # ══════════════════════════════════════════════════════════════════
-# القسم الثالث: مصنع العلف
+# القسم الثالث: مصنع العلف (المكونات، المخزون، حركات الوارد/المنصرف)
 # ══════════════════════════════════════════════════════════════════
 
 @app.route('/api/dashboard', methods=['GET'])
@@ -1345,16 +1396,18 @@ def add_factory_transaction():
     req_data = request.get_json()
 
     ingredient_key = req_data.get('ingredient_key')
-    trans_type = req_data.get('type')
+    trans_type = req_data.get('type')  # وارد أو منصرف
     bags_count = int(req_data.get('bags_count', 0))
     bag_weight = float(req_data.get('bag_weight', 0))
 
+    # حساب إجمالي الوزن بالكيلوجرام المستهدف لهذه العملية
     total_kg = bags_count * bag_weight
 
     data = load_data()
     factory = data["feed_factory"]
 
     if ingredient_key in factory['ingredients']:
+        # تعديل تراكمي للمخزون بالكيلوجرام
         if trans_type == 'وارد':
             factory['ingredients'][ingredient_key]['stockKg'] += total_kg
         elif trans_type == 'منصرف':
@@ -1362,6 +1415,7 @@ def add_factory_transaction():
             if factory['ingredients'][ingredient_key]['stockKg'] < 0:
                 factory['ingredients'][ingredient_key]['stockKg'] = 0
 
+        # تسجيل الحركة متضمنة تخصيص الشكائر وأوزانها كمرجع في السجل
         new_log = {
             "id": str(len(factory['history'][ingredient_key]) + 1),
             "date": datetime.now().strftime("%Y/%m/%d %I:%M %p"),
@@ -1387,10 +1441,13 @@ def add_factory_transaction():
 
 
 # ══════════════════════════════════════════════════════════════════
-# القسم الرابع: متابعة الديون/الأشخاص
+# القسم الرابع: متابعة الديون/الأشخاص (الأرصدة والمعاملات)
 # ══════════════════════════════════════════════════════════════════
 
 def sync_debt_payments_from_bank(data):
+    """يبحث في معاملات إيصالات البنك عن أي معاملة القسم فيها 'الديون' والنوع فيه
+    اسم شخص مسجّل في نظام الديون، ويضيفها تلقائياً كدفعة تُخصم من دين ذلك الشخص
+    (بدون تكرار الخصم لنفس الإيصال مرتين)."""
     debts = data["debts"]
     people = debts["people"]
     if not people:
@@ -1404,6 +1461,7 @@ def sync_debt_payments_from_bank(data):
         if section != "الديون" and "ديون" not in section:
             continue
 
+        # معرّف ثابت لهذه المعاملة البنكية (رقم العملية من الإيصال نفسه)
         source_id = str(bank_tx.get("رقم_العملية", "")).strip()
         if not source_id or source_id in already_synced:
             continue
@@ -1449,7 +1507,7 @@ def sync_debt_payments_from_bank(data):
 def get_persons():
     data = load_data()
     sync_debt_payments_from_bank(data)
-    data = load_data()
+    data = load_data()  # إعادة القراءة بعد التزامن للحصول على أحدث نسخة
     debts = data["debts"]
     result = []
     for p in debts["people"]:
@@ -1560,7 +1618,7 @@ if __name__ == '__main__':
     print("=" * 50)
     print("🚀 السيرفر الموحّد جاهز (جهات اتصال / عمال / OCR / مزرعة دواجن)")
     print(f"📁 ملف البيانات: {DATA_FILE}")
-    print("📍 يعمل على المنفذ 8080")
+    print("📍 يعمل على المنفذ 5000")
     print("=" * 50)
     port = int(os.environ.get("PORT", 8080))
     app.run(host='0.0.0.0', port=port, debug=False)
