@@ -430,14 +430,18 @@ def save_transaction_record(new_data):
 
 # ─── دوال بوت تيليجرام (@Alwatania_Reports_bot) ────────────────────
 
-def send_telegram_message(text):
-    """يرسل رسالة نصية لكل المحادثات المسجّلة (اللي بعتت /start للبوت)."""
+def get_telegram_chat_ids():
+    """يرجع قائمة كل المحادثات المسجّلة (اللي بعتت /start للبوت)."""
     try:
         data = load_data()
-        chat_ids = data.get("telegram", {}).get("chat_ids", [])
+        return list(data.get("telegram", {}).get("chat_ids", []))
     except Exception as e:
         print("❌ خطأ أثناء قراءة بيانات تيليجرام:", e)
-        return
+        return []
+
+def send_telegram_message(text):
+    """يرسل رسالة نصية لكل المحادثات المسجّلة (اللي بعتت /start للبوت)."""
+    chat_ids = get_telegram_chat_ids()
     if not chat_ids:
         print("⚠️ لم يتم إرسال رسالة تيليجرام: لا توجد أي محادثة مسجّلة بعد "
               "(لازم ترسل /start للبوت @Alwatania_Reports_bot أولاً).")
@@ -454,6 +458,30 @@ def send_telegram_message(text):
                       f"{resp.status_code} - {resp.text}")
         except Exception as e:
             print(f"❌ استثناء أثناء إرسال رسالة تيليجرام للمحادثة {chat_id}:", e)
+
+def send_telegram_document(file_path, caption=""):
+    """يرسل ملفًا (مثل نسخة احتياطية من data.json) لكل المحادثات المسجّلة."""
+    chat_ids = get_telegram_chat_ids()
+    if not chat_ids:
+        print("⚠️ لم يتم إرسال الملف: لا توجد أي محادثة مسجّلة بعد.")
+        return
+    if not os.path.exists(file_path):
+        print(f"❌ لم يتم إرسال الملف: المسار غير موجود {file_path}")
+        return
+    for chat_id in chat_ids:
+        try:
+            with open(file_path, "rb") as f:
+                resp = requests.post(
+                    f"{TELEGRAM_API_BASE}/sendDocument",
+                    data={"chat_id": chat_id, "caption": caption},
+                    files={"document": (os.path.basename(file_path), f)},
+                    timeout=30
+                )
+            if resp.status_code != 200:
+                print(f"❌ فشل إرسال الملف للمحادثة {chat_id}: "
+                      f"{resp.status_code} - {resp.text}")
+        except Exception as e:
+            print(f"❌ استثناء أثناء إرسال الملف للمحادثة {chat_id}:", e)
 
 def poll_telegram_updates():
     """يستطلع تحديثات البوت بشكل دوري لتسجيل أي محادثة جديدة بعتت /start،
@@ -569,6 +597,12 @@ def send_daily_telegram_report():
             lines.append("لا توجد أي معاملات أو تسجيلات مرتبطة اليوم.")
 
         send_telegram_message("\n".join(lines))
+
+        # نسخة احتياطية يومية من ملف البيانات كاملاً بعد التقرير مباشرة
+        send_telegram_document(
+            DATA_FILE,
+            caption=f"🗄️ نسخة احتياطية من data.json - {today_str}"
+        )
     except Exception as e:
         print("❌ خطأ أثناء إنشاء/إرسال التقرير اليومي:", e)
 
@@ -591,7 +625,8 @@ def home():
             "add_debt_transaction": "/transactions",
             "telegram_status": "/api/telegram/status",
             "telegram_send_test": "/api/telegram/test",
-            "telegram_send_daily_report_now": "/api/telegram/report/send"
+            "telegram_send_daily_report_now": "/api/telegram/report/send",
+            "telegram_poll_now": "/api/telegram/poll_now"
         }
     })
 
@@ -601,10 +636,24 @@ def home():
 def telegram_status():
     data = load_data()
     tg = data.get("telegram", default_telegram())
+
+    bot_info = None
+    bot_error = None
+    try:
+        resp = requests.get(f"{TELEGRAM_API_BASE}/getMe", timeout=10)
+        if resp.status_code == 200:
+            bot_info = resp.json().get("result")
+        else:
+            bot_error = f"{resp.status_code} - {resp.text}"
+    except Exception as e:
+        bot_error = str(e)
+
     return jsonify({
         "success": True,
         "registered_chats": len(tg.get("chat_ids", [])),
-        "chat_ids": tg.get("chat_ids", [])
+        "chat_ids": tg.get("chat_ids", []),
+        "bot_info": bot_info,
+        "bot_connection_error": bot_error
     })
 
 @app.route('/api/telegram/test', methods=['POST'])
@@ -625,6 +674,19 @@ def telegram_test():
 def telegram_send_report_now():
     send_daily_telegram_report()
     return jsonify({"success": True, "message": "تم إرسال التقرير اليومي."})
+
+@app.route('/api/telegram/poll_now', methods=['POST'])
+def telegram_poll_now():
+    """استطلاع فوري يدوي لتحديثات تيليجرام - مفيد للتشخيص لو المحادثة
+    ما تسجّلت تلقائيًا بعد إرسال /start."""
+    poll_telegram_updates()
+    data = load_data()
+    tg = data.get("telegram", default_telegram())
+    return jsonify({
+        "success": True,
+        "registered_chats": len(tg.get("chat_ids", [])),
+        "chat_ids": tg.get("chat_ids", [])
+    })
 
 # --- جهات الاتصال ---
 
@@ -1092,10 +1154,21 @@ scheduler.add_job(
     id='telegram_daily_report', replace_existing=True
 )
 
+# حذف أي webhook قديم قد يكون مسجّلاً على هذا التوكن (لو كان مفعّل، getUpdates
+# يفشل بصمت بخطأ "Conflict" ولا يسجّل أي محادثة أبدًا) - خطوة أمان لمرة واحدة عند الإقلاع
+try:
+    wh_resp = requests.get(f"{TELEGRAM_API_BASE}/deleteWebhook", timeout=10)
+    print(f"ℹ️ حذف webhook تيليجرام (إن وُجد): {wh_resp.status_code} - {wh_resp.text}")
+except Exception as e:
+    print("❌ تعذّر التحقق من/حذف webhook تيليجرام:", e)
+
 # استطلاع فوري عند الإقلاع (بدل انتظار 20 ثانية) ثم رسالة تأكيد أن السيرفر اشتغل
 try:
     poll_telegram_updates()
-    send_telegram_message("✅ <b>السيرفر اشتغل بنجاح</b> وجاهز الآن لاستقبال العمليات.")
+    send_telegram_message(
+        "✅ <b>السيرفر جاهز ويعمل بكفاءة</b>\n"
+        f"تم تشغيل النظام بنجاح في {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M:%S') if LOCAL_TZ else datetime.now().strftime('%Y-%m-%d %H:%M:%S')}."
+    )
 except Exception as e:
     print("❌ خطأ أثناء إرسال رسالة بدء التشغيل لتيليجرام:", e)
 
